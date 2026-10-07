@@ -1,10 +1,11 @@
-// One JSON line per poll: what a person sitting beside the user would see and hear.
-//   {"t": s since start, "idle_s": s since the last key or mouse input, "focus": {"app", "title", "text"},
+// One JSON line at startup and per request: what a person sitting beside the user would see and hear.
+//   {"t": s since start, "capturedAt": epoch ms at completion, "targetHwnd": decimal string, "sequence": request number or null,
+//    "idle_s": s since the last key or mouse input, "focus": {"app", "title", "text"},
 //    "media": [{"app", "title", "artist"}], "mic": [app], "headphones": device name}
 // Past `idle_s`, a field is there only when it has something to say: nothing playing, no `media`; sound on speakers, no `headphones`.
-// usage: kernel [poll_seconds=10] [own_pid]
+// usage: kernel [own_pid]
 // `focus` is the last foreground window that isn't own_pid's: clicking the companion must not make us read the companion.
-// Any line on stdin asks for a read right now, e.g. the moment the user starts talking to her.
+// A positive sequence number on stdin asks for a read; the reply carries that sequence.
 #include <windows.h>
 #include <initguid.h> // these three in this order: initguid has the next two define their property keys here, not just declare them,
 #include <mmdeviceapi.h> // and this one brings the macro
@@ -15,6 +16,8 @@
 #include <winrt/Windows.Media.Control.h>
 
 #include <chrono>
+#include <charconv>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
@@ -77,8 +80,8 @@ void read(IUIAutomationElement* e, const std::wstring& said, std::wstring& o) {
 }
 
 // The window's text as a person glancing at it would read it. Chromium builds its tree only once someone has asked,
-// so the first poll of such an app comes back nearly empty and the next one has the page.
-// ponytail: blocks for as long as the app takes to answer (the desktop: 4 s); walk on a second thread if a poll must not stall
+// so the first read of such an app comes back nearly empty and the next one has the page.
+// ponytail: blocks for as long as the app takes to answer (the desktop: 4 s); walk on a second thread if a request must not stall
 std::wstring text(HWND w) {
     winrt::com_ptr<IUIAutomationElement> root;
     std::wstring o;
@@ -111,8 +114,7 @@ void CALLBACK foreground(HWINEVENTHOOK, DWORD, HWND w, LONG, LONG, DWORD, DWORD)
 }
 
 // ponytail: GetForegroundWindow says ApplicationFrameHost for UWP apps; take the pid from the UIA focused element instead
-std::string focus() {
-    HWND w = IsWindow(target) ? target : GetForegroundWindow(); // UIA reads a window in the background just as well
+std::string focus(HWND w) {
     wchar_t title[512]{};
     GetWindowTextW(w, title, 512);
     DWORD pid = 0;
@@ -130,7 +132,7 @@ std::string media() {
     static auto manager = GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
     std::string all;
     for (auto session : manager.GetSessions()) {
-        try { // a session can close between being listed and being asked: leave it out of this poll
+        try { // a session can close between being listed and being asked: leave it out of this read
             if (session.GetPlaybackInfo().PlaybackStatus() != GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) continue;
             auto properties = session.TryGetMediaPropertiesAsync().get();
             std::wstring app{session.SourceAppUserModelId()}; // ponytail: a packaged app's id is a long package string, not a name
@@ -200,8 +202,7 @@ int idle_s() {
 }
 
 int main(int argc, char** argv) {
-    int poll = argc > 1 ? atoi(argv[1]) : 10;
-    own = argc > 2 ? atoi(argv[2]) : 0;
+    own = argc > 1 ? atoi(argv[1]) : 0;
     winrt::init_apartment();
     uia = winrt::create_instance<IUIAutomation>(CLSID_CUIAutomation);
     uia->CreateCacheRequest(cache.put());
@@ -211,24 +212,34 @@ int main(int argc, char** argv) {
     cache->put_TreeScope(TreeScope_Subtree);
     audio = winrt::create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator));
     auto start = std::chrono::steady_clock::now();
-    auto report = [&] {
+    auto report = [&](std::uintptr_t sequence = 0) {
+        HWND w = IsWindow(target) ? target : GetForegroundWindow(); // Keep the same foreground targeting for this whole read.
+        auto fields = std::format(R"("idle_s":{}{}{}{}{})", idle_s(), focus(w), media(), mic(), headphones());
+        auto capturedAt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        std::println(R"({{"t":{:.1f},"idle_s":{}{}{}{}{}}})", t, idle_s(), focus(), media(), mic(), headphones());
+        std::println(R"({{"t":{:.1f},"capturedAt":{},"targetHwnd":"{}","sequence":{},{}}})", t, capturedAt,
+            reinterpret_cast<std::uintptr_t>(w), sequence ? std::to_string(sequence) : "null", fields);
         fflush(stdout); // println throws once the reader is gone, which ends us
     };
 
     target = GetForegroundWindow();
     SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, foreground, 0, 0, WINEVENT_OUTOFCONTEXT);
-    // stdin lines become thread messages, so reads, polls and the hook all run on this thread; stdin closing ends us
+    // Create the message queue before stdin can post a request, including during the startup read.
+    MSG m;
+    PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE);
+    // Requests and the hook run on this thread; stdin closing ends us.
     std::thread([main = GetCurrentThreadId()] {
-        for (std::string line; std::getline(std::cin, line);) PostThreadMessageW(main, WM_APP, 0, 0);
+        for (std::string line; std::getline(std::cin, line);) {
+            std::uintptr_t sequence = 0;
+            auto parsed = std::from_chars(line.data(), line.data() + line.size(), sequence);
+            if (parsed.ec == std::errc{} && parsed.ptr == line.data() + line.size() && sequence > 0)
+                PostThreadMessageW(main, WM_APP, sequence, 0);
+        }
         PostThreadMessageW(main, WM_QUIT, 0, 0);
     }).detach();
-    SetTimer(nullptr, 0, poll * 1000, nullptr);
     report();
-    MSG m;
     while (GetMessageW(&m, nullptr, 0, 0)) { // also where the hook's callbacks get delivered
-        if (m.message == WM_TIMER || m.message == WM_APP) report();
+        if (m.message == WM_APP) report(m.wParam);
         DispatchMessageW(&m);
     }
 }

@@ -1,5 +1,5 @@
 # Feed the kernel's inquiries, as they are, to a small model and print what it makes of them.
-# usage: python probe.py [jev|local] [poll_seconds]      jev reads AI_GATEWAY_API_KEY; local needs torch + transformers + CUDA
+# usage: python probe.py [jev|local] (press Enter to capture again)      jev reads AI_GATEWAY_API_KEY; local needs torch + transformers + CUDA
 import json, os, subprocess, sys, time, urllib.request
 
 USER = os.getlogin()
@@ -85,13 +85,21 @@ def local():  # Aisling's brain.py: one forward pass per question, no generation
 backend = sys.argv[1] if len(sys.argv) > 1 else 'jev'
 ask = local() if backend == 'local' else jev
 show = lambda v: [round(x, 2) for x in v] if isinstance(v, list) else round(v, 2)
-kernel = subprocess.Popen([KERNEL, *sys.argv[2:3]], stdout=subprocess.PIPE, encoding='utf-8')
-for line in kernel.stdout:
+kernel = subprocess.Popen([KERNEL], stdin=subprocess.PIPE, stdout=subprocess.PIPE, encoding='utf-8')
+for sequence, line in enumerate(kernel.stdout, start=1):
     state = json.loads(line)
-    del state['t']  # a clock reading says nothing to a model
+    for key in ('t', 'capturedAt', 'targetHwnd', 'sequence'):
+        state.pop(key, None)  # capture metadata is not model input
     start = time.perf_counter()
     answers = ask(state, QUESTIONS[backend])
     focus = state.get('focus', {})  # the line itself is a wall of text: print its outline
     print(f"{focus.get('app')} | {focus.get('title', '')[:50]} | {len(focus.get('text', ''))} chars | idle {state['idle_s']} s"
           + ''.join(f" | {key}: {json.dumps(state[key], ensure_ascii=False)}" for key in ('media', 'mic', 'headphones') if key in state),
           '\n   ', {name: show(v) for name, v in answers.items()}, f'{(time.perf_counter() - start) * 1000:.0f} ms', flush=True)
+    try:
+        input('Press Enter to capture again: ')
+    except EOFError:
+        break
+    kernel.stdin.write(f'{sequence}\n')
+    kernel.stdin.flush()
+kernel.stdin.close()
