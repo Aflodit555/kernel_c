@@ -214,7 +214,16 @@ int main(int argc, char** argv) {
     auto start = std::chrono::steady_clock::now();
     auto report = [&](std::uintptr_t sequence = 0) {
         HWND w = IsWindow(target) ? target : GetForegroundWindow(); // Keep the same foreground targeting for this whole read.
-        auto fields = std::format(R"("idle_s":{}{}{}{}{})", idle_s(), focus(w), media(), mic(), headphones());
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (pid == own) w = nullptr; // Startup/fallback must also exclude the companion's own conversation.
+        // UIA may block. Sequence the reads explicitly and query Playing media
+        // last, so a slow foreground read cannot age an earlier song snapshot.
+        auto focused = w ? focus(w) : std::string{};
+        auto microphone = mic();
+        auto output = headphones();
+        auto playing = media();
+        auto fields = std::format(R"("idle_s":{}{}{}{}{})", idle_s(), focused, playing, microphone, output);
         auto capturedAt = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         std::println(R"({{"t":{:.1f},"capturedAt":{},"targetHwnd":"{}","sequence":{},{}}})", t, capturedAt,
